@@ -2,65 +2,99 @@ services:
   mongo:
     image: mongo:7
     container_name: todo-backend-mongo
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     ports:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
 
   api-gateway:
-    image: node:20-alpine
+    image: ${ECR_REGISTRY:-local}/todo-backend-api-gateway:${IMAGE_TAG:-latest}
     container_name: todo-backend-api-gateway
-    working_dir: /app/api-gateway
-    command: sh -c "npm install && npm run dev"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    env_file:
+      - ./api-gateway/.env
     environment:
       PORT: 4000
       AUTH_SERVICE_URL: http://auth-service:4001
       TODO_SERVICE_URL: http://todo-service:4002
-      JWT_SECRET: test-jwt-secret-2026
     ports:
       - "4000:4000"
-    volumes:
-      - ./api-gateway:/app/api-gateway
-      - api_gateway_node_modules:/app/api-gateway/node_modules
     depends_on:
       - auth-service
       - todo-service
 
   auth-service:
-    image: node:20-alpine
+    image: ${ECR_REGISTRY:-local}/todo-backend-auth-service:${IMAGE_TAG:-latest}
     container_name: todo-backend-auth-service
-    working_dir: /app/auth-service
-    command: sh -c "npm install && npm run dev"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4001/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    env_file:
+      - ./auth-service/.env
     environment:
       PORT: 4001
       MONGO_URI: mongodb://mongo:27017/ec2test
-      JWT_SECRET: test-jwt-secret-2026
     ports:
       - "4001:4001"
-    volumes:
-      - ./auth-service:/app/auth-service
-      - auth_service_node_modules:/app/auth-service/node_modules
     depends_on:
       - mongo
 
   todo-service:
-    image: node:20-alpine
+    image: ${ECR_REGISTRY:-local}/todo-backend-todo-service:${IMAGE_TAG:-latest}
     container_name: todo-backend-todo-service
-    working_dir: /app/todo-service
-    command: sh -c "npm install && npm run dev"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4002/health >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    env_file:
+      - ./todo-service/.env
     environment:
       PORT: 4002
       MONGO_URI: mongodb://mongo:27017/ec2test
     ports:
       - "4002:4002"
-    volumes:
-      - ./todo-service:/app/todo-service
-      - todo_service_node_modules:/app/todo-service/node_modules
     depends_on:
       - mongo
 
 volumes:
   mongo_data:
-  api_gateway_node_modules:
-  auth_service_node_modules:
-  todo_service_node_modules:

@@ -1,0 +1,318 @@
+name: Build, Push, and Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production-backend-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+  ECR_REPOSITORY_PREFIX: todo-backend
+  PROJECT_DIR: /home/ubuntu/backend
+  BRANCH: main
+
+jobs:
+  build-and-push:
+    name: Build and push Docker images
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    outputs:
+      ecr-registry: ${{ steps.login-ecr.outputs.registry }}
+      image-tag: ${{ steps.image-meta.outputs.image-tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Validate deployment inputs
+        run: |
+          set -Eeuo pipefail
+          test -n "${AWS_REGION}" || { echo "Missing GitHub Actions variable: AWS_REGION"; exit 1; }
+          test -n "${AWS_ROLE_ARN}" || { echo "Missing GitHub Actions variable: AWS_ROLE_ARN"; exit 1; }
+
+      # Uses GitHub OIDC to assume an AWS role. Do not store AWS access keys in
+      # GitHub Secrets. The role ARN is a non-secret GitHub Actions variable.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.1
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2.1.6
+
+      - name: Resolve image tag
+        id: image-meta
+        run: echo "image-tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure ECR repositories exist
+        env:
+          SERVICES: api-gateway auth-service todo-service
+        run: |
+          set -Eeuo pipefail
+
+          for service in ${SERVICES}; do
+            repository="${ECR_REPOSITORY_PREFIX}-${service}"
+
+            if aws ecr describe-repositories --repository-names "${repository}" >/dev/null 2>&1; then
+              echo "ECR repository exists: ${repository}"
+              continue
+            fi
+
+            echo "Creating ECR repository: ${repository}"
+            aws ecr create-repository \
+              --repository-name "${repository}" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256 \
+              >/dev/null
+          done
+
+      - name: Build and push service images
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.image-meta.outputs.image-tag }}
+        run: |
+          set -Eeuo pipefail
+
+          build_and_push() {
+            service="$1"
+            context="backend/${service}"
+            repository="${ECR_REGISTRY}/${ECR_REPOSITORY_PREFIX}-${service}"
+
+            echo "Building ${repository}:${IMAGE_TAG}"
+            docker build \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              -t "${repository}:${IMAGE_TAG}" \
+              -t "${repository}:latest" \
+              "${context}"
+
+            echo "Pushing ${repository}:${IMAGE_TAG}"
+            docker push "${repository}:${IMAGE_TAG}"
+            docker push "${repository}:latest"
+          }
+
+          build_and_push api-gateway
+          build_and_push auth-service
+          build_and_push todo-service
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: build-and-push
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Deploy pulled images on EC2
+        uses: appleboy/ssh-action@v1.2.5
+        timeout-minutes: 22
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          timeout: 60s
+          command_timeout: 22m
+          script: |
+            #!/usr/bin/env bash
+            set -Eeuo pipefail
+
+            PROJECT_DIR="${{ env.PROJECT_DIR }}"
+            REPO_URL="${{ github.server_url }}/${{ github.repository }}.git"
+            BRANCH="${{ env.BRANCH }}"
+            AWS_REGION="${{ env.AWS_REGION }}"
+            ECR_REGISTRY="${{ needs.build-and-push.outputs.ecr-registry }}"
+            IMAGE_TAG="${{ needs.build-and-push.outputs.image-tag }}"
+            STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            COMPOSE_DIR=""
+
+            log() {
+              printf '\n[%s] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*"
+            }
+
+            compose() {
+              docker compose --env-file "${COMPOSE_DIR}/.deploy.env" "$@"
+            }
+
+            print_compose_logs() {
+              if [ -n "${COMPOSE_DIR}" ] && [ -f "${COMPOSE_DIR}/docker-compose.yml" ]; then
+                log "Deployment failed. Printing docker compose status and logs."
+                cd "${COMPOSE_DIR}"
+                compose ps || true
+                compose logs --no-color --tail=200 || true
+              else
+                log "Deployment failed before docker compose directory was available."
+              fi
+            }
+
+            on_error() {
+              exit_code=$?
+              print_compose_logs
+              log "Deployment status: FAILED"
+              exit "${exit_code}"
+            }
+
+            trap on_error ERR
+
+            log "Starting backend deployment from ECR"
+            log "Repository: ${REPO_URL}"
+            log "Branch: ${BRANCH}"
+            log "Image tag: ${IMAGE_TAG}"
+            log "ECR registry: ${ECR_REGISTRY}"
+            log "Target directory: ${PROJECT_DIR}"
+
+            log "Verifying required host tools"
+            command -v git >/dev/null 2>&1 || { echo "git is required but is not installed."; exit 1; }
+            command -v docker >/dev/null 2>&1 || { echo "Docker is required but is not installed."; exit 1; }
+            docker compose version >/dev/null 2>&1 || { echo "Docker Compose v2 is required but is not installed."; exit 1; }
+            command -v aws >/dev/null 2>&1 || { echo "AWS CLI is required on EC2 for ECR docker login."; exit 1; }
+
+            docker --version
+            docker compose version
+            aws --version
+
+            log "Cloning or resetting repository to origin/${BRANCH}"
+            if [ -d "${PROJECT_DIR}/.git" ]; then
+              cd "${PROJECT_DIR}"
+              git fetch --prune origin "${BRANCH}"
+              git checkout -B "${BRANCH}" "origin/${BRANCH}"
+              git reset --hard "origin/${BRANCH}"
+            elif [ -e "${PROJECT_DIR}" ]; then
+              echo "${PROJECT_DIR} exists but is not a git repository."
+              echo "Refusing to remove it automatically because EC2-local production secrets may live there."
+              exit 1
+            else
+              mkdir -p "$(dirname "${PROJECT_DIR}")"
+              git clone --branch "${BRANCH}" --single-branch "${REPO_URL}" "${PROJECT_DIR}"
+              cd "${PROJECT_DIR}"
+              git fetch --prune origin "${BRANCH}"
+              git reset --hard "origin/${BRANCH}"
+            fi
+
+            DEPLOYED_COMMIT="$(git rev-parse HEAD)"
+            log "Checked out commit: ${DEPLOYED_COMMIT}"
+
+            if [ -f "${PROJECT_DIR}/docker-compose.yml" ]; then
+              COMPOSE_DIR="${PROJECT_DIR}"
+            elif [ -f "${PROJECT_DIR}/backend/docker-compose.yml" ]; then
+              COMPOSE_DIR="${PROJECT_DIR}/backend"
+            else
+              echo "Could not find docker-compose.yml in ${PROJECT_DIR} or ${PROJECT_DIR}/backend."
+              exit 1
+            fi
+
+            cd "${COMPOSE_DIR}"
+            log "Using compose directory: ${COMPOSE_DIR}"
+
+            for env_file in api-gateway/.env auth-service/.env todo-service/.env; do
+              if [ ! -f "${COMPOSE_DIR}/${env_file}" ]; then
+                echo "Missing EC2-local secret/config file: ${COMPOSE_DIR}/${env_file}"
+                echo "Create it on EC2. Application secrets are intentionally not stored in GitHub."
+                exit 1
+              fi
+            done
+
+            umask 077
+            cat > "${COMPOSE_DIR}/.deploy.env" <<EOF
+            ECR_REGISTRY=${ECR_REGISTRY}
+            IMAGE_TAG=${IMAGE_TAG}
+            EOF
+
+            log "Logging Docker into Amazon ECR from EC2 instance role"
+            aws ecr get-login-password --region "${AWS_REGION}" \
+              | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+            log "Validating docker compose configuration"
+            compose config --quiet
+
+            log "Pulling versioned images"
+            compose pull
+
+            log "Reconciling services from pulled images"
+            compose up -d --remove-orphans
+
+            log "Waiting for Docker health checks"
+            services="$(compose ps --services)"
+            if [ -z "${services}" ]; then
+              echo "No docker compose services were found."
+              exit 1
+            fi
+
+            for attempt in $(seq 1 30); do
+              not_ready=""
+
+              for service in ${services}; do
+                container_id="$(compose ps -q "${service}")"
+                if [ -z "${container_id}" ]; then
+                  not_ready="${not_ready} ${service}:missing"
+                  continue
+                fi
+
+                running="$(docker inspect -f '{{.State.Running}}' "${container_id}")"
+                health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "${container_id}")"
+
+                if [ "${running}" != "true" ]; then
+                  not_ready="${not_ready} ${service}:not-running"
+                  continue
+                fi
+
+                if [ "${health}" = "healthy" ]; then
+                  continue
+                fi
+
+                if [ "${health}" = "none" ]; then
+                  echo "Service ${service} does not define a Docker healthcheck."
+                  exit 1
+                fi
+
+                not_ready="${not_ready} ${service}:${health}"
+              done
+
+              if [ -z "${not_ready}" ]; then
+                log "All Docker health checks are healthy"
+                break
+              fi
+
+              if [ "${attempt}" -eq 30 ]; then
+                echo "Services did not become ready:${not_ready}"
+                exit 1
+              fi
+
+              log "Readiness check ${attempt}/30 pending:${not_ready}"
+              sleep 5
+            done
+
+            log "Safely cleaning unused Docker resources"
+            docker image prune -f
+
+            log "Deployment summary"
+            echo "Started at: ${STARTED_AT}"
+            echo "Finished at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            echo "Status: SUCCESS"
+            echo "Branch: ${BRANCH}"
+            echo "Deployed commit: ${DEPLOYED_COMMIT}"
+            echo "Image tag: ${IMAGE_TAG}"
+            echo ""
+            echo "Running containers:"
+            compose ps
+            echo ""
+            echo "Image versions:"
+            compose images
+
+            log "Deployment status: SUCCESS"
